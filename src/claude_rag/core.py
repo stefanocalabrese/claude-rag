@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 
 DB_DIR = Path(os.environ.get("CLAUDE_RAG_DB", str(Path.home() / ".local" / "share" / "claude-rag" / "lancedb")))
 LM_STUDIO_URL = os.environ.get("CLAUDE_RAG_LM_STUDIO_URL", "http://localhost:1234/v1")
-LM_STUDIO_MODEL = os.environ.get("CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL", "")
+# Default embedding model; override with CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL.
+# Must match the model id LM Studio exposes at /v1/models.
+LM_STUDIO_MODEL = os.environ.get("CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL", "text-embedding-nomic-embed-text-v1.5")
 LOCK_DIR = Path(os.environ.get("CLAUDE_RAG_LOCKS", str(Path.home() / ".local" / "share" / "claude-rag" / "locks")))
 LOG_DIR = Path(os.environ.get("CLAUDE_RAG_LOGS", str(Path.home() / ".local" / "share" / "claude-rag" / "logs")))
 
@@ -235,7 +237,10 @@ def search_table(table_name: str, query: str, k: int = 10,
                  filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Semantic search over a LanceDB table.
 
-    Returns list of dicts with 'text', 'score' (distance), and metadata fields.
+    Embeds the query via LM Studio, runs a vector search (applying any
+    equality filters), and re-ranks the candidates by cosine distance. Each
+    returned row carries a ``vector_distance`` field (0.0 = identical,
+    higher = less similar) plus the stored text and metadata columns.
     """
     db = _get_db_connection()
 
@@ -245,64 +250,57 @@ def search_table(table_name: str, query: str, k: int = 10,
 
     table = db.open_table(table_name)
 
-    # Build filter expression
+    # Build an equality filter expression (SQL-style) for LanceDB.
     where = None
     if filters:
         conditions = []
         for key, value in filters.items():
             if isinstance(value, str):
-                conditions.append(f"{key} = '{value}'")
-            elif isinstance(value, int):
+                escaped = value.replace("'", "''")  # escape quotes for SQL
+                conditions.append(f"{key} = '{escaped}'")
+            elif isinstance(value, (int, float)):
                 conditions.append(f"{key} = {value}")
             else:
                 continue  # skip unsupported filter types
         where = " AND ".join(conditions) if conditions else None
 
-    # Fetch results as list of dicts (no pandas dependency)
+    # Embed the query once; reuse the vector for the search and the re-rank.
+    query_vec = embed_texts([query])[0]
+
+    search = table.search(query_vec).limit(k * 3)
+    if where:
+        search = search.where(where)
+
     try:
-        results = table.search(query).limit(k * 3).to_list()
+        results = search.to_list()
     except Exception:
-        # Fallback to pandas if available
-        try:
-            df = table.search(query).limit(k * 3).to_pandas()
-            if df.empty:
-                return []
-            results = df.to_dict("records")
-        except Exception:
-            logger.warning("Search failed for table '%s'", table_name)
-            return []
+        logger.warning("Search failed for table '%s'", table_name, exc_info=True)
+        return []
 
     if not results:
         return []
 
-    # Re-rank by cosine distance (LanceDB returns raw distances, recompute for accuracy)
-    query_vec = embed_texts([query])[0]
-
+    # Re-rank by cosine distance and attach it so callers can surface a score.
+    norm_q = sum(a * a for a in query_vec) ** 0.5
     scored: list[tuple[float, dict]] = []
     for row in results:
         vec_data = row.get("vector")
-        if not vec_data:
+        if vec_data is None:
             continue
 
-        # Convert to list if it's a numpy array or similar
-        vec = list(vec_data) if hasattr(vec_data, "__iter__") and not isinstance(vec_data, str) else vec_data
-
-        # Cosine similarity
+        vec = list(vec_data)  # numpy array / Arrow list -> plain list
         dot = sum(a * b for a, b in zip(query_vec, vec))
-        norm_q = sum(a * a for a in query_vec) ** 0.5
         norm_v = sum(b * b for b in vec) ** 0.5
-
         if norm_q == 0 or norm_v == 0:
             continue
 
-        similarity = dot / (norm_q * norm_v)
-        distance = 1.0 - similarity
-
+        distance = 1.0 - (dot / (norm_q * norm_v))
+        row["vector_distance"] = distance
         scored.append((distance, row))
 
-    # Sort by distance (lower = more similar) and take top k
+    # Sort by distance (lower = more similar) and take top k.
     scored.sort(key=lambda x: x[0])
-    return [item for _, item in scored[:k]]
+    return [row for _, row in scored[:k]]
 
 
 def table_exists(table_name: str) -> bool:
@@ -334,33 +332,19 @@ def get_table_stats(table_name: str) -> dict[str, Any]:
 
 
 def optimize_table(table_name: str, cleanup_older_than_days: int = 7) -> None:
-    """Run LanceDB compaction and prune old versions.
+    """Compact the table and prune versions older than ``cleanup_older_than_days``.
 
-    This reclaims space from deleted/updated rows and removes stale versions.
+    LanceDB's ``optimize`` merges small fragments (reclaiming space from
+    deleted/updated rows) and cleans up stale versions in a single pass.
     """
     db = _get_db_connection()
     if table_name not in db.table_names():
         return
 
     table = db.open_table(table_name)
-    cutoff = datetime.now(timezone.utc).timestamp() - (cleanup_older_than_days * 86400)
-
-    # Prune versions older than the cutoff
     try:
-        table.version()  # current version
-        for v in range(1, table.version().version_number):
-            ver_info = table.version(v)
-            if ver_info.timestamp.timestamp() < cutoff:
-                logger.info("Pruning version %d of table '%s'", v, table_name)
-                # LanceDB doesn't have a direct prune API in all versions;
-                # optimize() handles compaction. Version pruning depends on version.
+        table.optimize(cleanup_older_than=timedelta(days=cleanup_older_than_days))
+        logger.info("Optimized table '%s' (pruned versions >%d days)",
+                    table_name, cleanup_older_than_days)
     except Exception as e:
-        logger.debug("Version pruning skipped for '%s': %s", table_name, e)
-
-    # Compact small files
-    try:
-        table.optimize("cleanup_old_versions",
-                       options={"older_than": datetime.fromtimestamp(cutoff, tz=timezone.utc)})
-        logger.info("Optimized table '%s' (cleanup >%d days)", table_name, cleanup_older_than_days)
-    except Exception as e:
-        logger.debug("Optimization for '%s' failed: %s", table_name, e)
+        logger.warning("Optimization for '%s' failed: %s", table_name, e)

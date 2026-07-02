@@ -38,8 +38,10 @@ mkdir -p "$INBOX"
 COPIED="${INBOX}/$(basename "$SESSION_JSONL")"
 cp "$SESSION_JSONL" "$COPIED" 2>/dev/null || true
 
-# Fire-and-forget: detach the ingest process
-nohup python3 "${SCRIPT_DIR}/ingest_transcript.py" "$COPIED" \
+# Fire-and-forget: detach the ingest process (use the project venv, not system python3)
+PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+[ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"  # fallback if venv missing
+nohup "$PYTHON_BIN" "${SCRIPT_DIR}/ingest_transcript.py" "$COPIED" \
     >> "${HOME}/.local/share/claude-rag/logs/hook.log" 2>&1 &
 
 echo "[claude-rag] Transcript ingest spawned (PID $!, session: $(basename "$SESSION_JSONL"))" >&2

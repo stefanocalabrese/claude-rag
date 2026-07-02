@@ -164,12 +164,8 @@ def ingest(directories: list[str] | None = None,
             else:
                 new_count += 1
 
-        # Batch upsert all chunks at once (one embed call)
+        # Batch upsert all chunks at once (upsert_chunks creates the table if needed)
         if all_chunks:
-            from claude_rag.core import upsert_chunks, _get_db_connection
-            db = _get_db_connection()
-            if "memory" not in db.table_names():
-                db.create_table("memory", data=[])  # create empty table first
             upsert_chunks("memory", all_chunks, all_metadata)
 
         _save_index(index)

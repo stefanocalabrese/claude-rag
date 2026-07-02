@@ -127,10 +127,7 @@ def ingest(file_path: str | Path, inbox_dir: Path | None = None) -> dict:
                 all_metadata.append(meta)
 
         if all_chunks:
-            from claude_rag.core import upsert_chunks, _get_db_connection
-            db = _get_db_connection()
-            if "memory" not in db.table_names():
-                db.create_table("memory", data=[])
+            from claude_rag.core import upsert_chunks
             upsert_chunks("memory", all_chunks, all_metadata)
 
         logger.info("Ingested %d exchanges (%d chunks) from %s",

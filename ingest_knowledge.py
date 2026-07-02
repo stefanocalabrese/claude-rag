@@ -186,10 +186,7 @@ def ingest(file_path: str | Path) -> dict:
             )
             all_metadata.append(meta)
 
-        from claude_rag.core import upsert_chunks, _get_db_connection
-        db = _get_db_connection()
-        if "knowledge" not in db.table_names():
-            db.create_table("knowledge", data=[])
+        from claude_rag.core import upsert_chunks
         upsert_chunks("knowledge", chunks, all_metadata)
 
         logger.info("Ingested %d chunks from %s (%s)", len(chunks), file_path.name, file_type)

@@ -82,10 +82,13 @@ python ingest_knowledge.py <path-to-pdf-or-folder>
 
 ### Claude Code MCP registration
 
-After scaffolding, register the MCP server:
+Register the MCP server using the project venv and the real server path
+(`src/claude_rag/mcp_server.py`). The venv is required — the server imports
+`fastmcp`/`lancedb`, which only exist inside it:
 
 ```bash
-claude mcp add claude-rag python <repo-root>/mcp_server.py
+claude mcp add claude-rag -- \
+  <repo-root>/.venv/bin/python <repo-root>/src/claude_rag/mcp_server.py
 ```
 
 ## Prerequisites
@@ -109,4 +112,10 @@ MacBook Pro, Apple Silicon, 64 GB unified memory. Embedding models are <1 GB; co
 
 ## Current status
 
-Scaffolded — all deliverables from `claude-rag-plan.md §10` are written. Syntax-checked and passing. Next steps: install deps (`pip install -e ".[dev]"`), load embedding model in LM Studio, test ingestion pipeline end-to-end.
+Working end-to-end (verified 2026-07-02). Environment is `uv`-managed
+(`.venv`, Python 3.12); deps installed via `uv pip install -e ".[dev]"`.
+Embeddings served by LM Studio model `text-embedding-nomic-embed-text-v1.5`
+(768-dim) — set as the default in `core.py`, overridable via
+`CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL`. Verified: real ingest (memory +
+knowledge tables), semantic search, project filter, idempotent dedup,
+`optimize_table`, and all 6 MCP tools registering over stdio.

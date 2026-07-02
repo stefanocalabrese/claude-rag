@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "claude-rag",
-    description="Local RAG + memory search for Claude Code",
+    instructions="Local RAG + memory search for Claude Code",
 )
 
 # ---------------------------------------------------------------------------
@@ -97,8 +97,8 @@ def search_all(query: str, k: int = 10) -> str:
             r["source"] = label
         output.extend(results)
 
-    # Sort by score and limit
-    output.sort(key=lambda x: x.get("score", 0))
+    # Merge both tables' hits and sort by distance (lower = more similar).
+    output.sort(key=lambda x: x.get("vector_distance", 1.0))
     return json.dumps(_format_results(output[:k], source_label=None), indent=2)
 
 
@@ -142,12 +142,11 @@ def search_recent(query: str, days: int = 7, k: int = 5) -> str:
     if not table_exists("memory"):
         return json.dumps({"error": "No memory table found. Run an ingest job first."}, indent=2)
 
-    # LanceDB filter: timestamp >= cutoff
     from datetime import datetime, timezone, timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
-    results = search_table("memory", query, k=k, filters={"project": ""})
-    # Post-filter by timestamp (LanceDB may not support datetime range filters uniformly)
+    # Fetch a wider candidate set (no project filter), then keep only recent chunks.
+    results = search_table("memory", query, k=max(k * 5, 25))
     recent = [r for r in results if r.get("timestamp", "") >= cutoff]
 
     return json.dumps(_format_results(recent[:k], source_label="memory"), indent=2)
@@ -190,6 +189,8 @@ def _format_results(results: list[dict], source_label: str | None) -> list[dict]
         }
         if source_label:
             entry["source"] = source_label
+        elif r.get("source"):
+            entry["source"] = r["source"]  # preserve per-row label from search_all
         formatted.append(entry)
     return formatted
 
