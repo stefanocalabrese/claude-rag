@@ -96,9 +96,20 @@ def _get_db_connection() -> lancedb.DBConnection:
     return lancedb.connect(str(DB_DIR))
 
 
+def _list_table_names(db: lancedb.DBConnection) -> list[str]:
+    """Return existing table names as a plain list.
+
+    LanceDB's ``table_names()`` is deprecated; ``list_tables()`` returns a
+    paginated ``ListTablesResponse`` wrapper, so unwrap its ``.tables`` (with
+    a fallback for older versions that already return a plain list).
+    """
+    result = db.list_tables()
+    return list(getattr(result, "tables", result))
+
+
 def _get_table(db: lancedb.DBConnection, table_name: str) -> lancedb.table.Table | None:
     """Get an existing table, or return None if it doesn't exist."""
-    if table_name in db.table_names():
+    if table_name in _list_table_names(db):
         return db.open_table(table_name)
     return None
 
@@ -213,7 +224,7 @@ def upsert_chunks(table_name: str, chunks: list[str],
         }
         records.append(record)
 
-    if table_name in db.table_names():
+    if table_name in _list_table_names(db):
         table = db.open_table(table_name)
         # Delete existing rows with matching ids, then add all (true upsert)
         existing_ids = [r["id"] for r in records]
@@ -244,7 +255,7 @@ def search_table(table_name: str, query: str, k: int = 10,
     """
     db = _get_db_connection()
 
-    if table_name not in db.table_names():
+    if table_name not in _list_table_names(db):
         logger.warning("Table '%s' does not exist", table_name)
         return []
 
@@ -306,13 +317,13 @@ def search_table(table_name: str, query: str, k: int = 10,
 def table_exists(table_name: str) -> bool:
     """Check if a LanceDB table exists."""
     db = _get_db_connection()
-    return table_name in db.table_names()
+    return table_name in _list_table_names(db)
 
 
 def get_table_stats(table_name: str) -> dict[str, Any]:
     """Return basic stats about a table (row count, etc.)."""
     db = _get_db_connection()
-    if table_name not in db.table_names():
+    if table_name not in _list_table_names(db):
         return {"exists": False}
 
     table = db.open_table(table_name)
@@ -338,7 +349,7 @@ def optimize_table(table_name: str, cleanup_older_than_days: int = 7) -> None:
     deleted/updated rows) and cleans up stale versions in a single pass.
     """
     db = _get_db_connection()
-    if table_name not in db.table_names():
+    if table_name not in _list_table_names(db):
         return
 
     table = db.open_table(table_name)
