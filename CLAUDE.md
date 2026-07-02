@@ -33,12 +33,12 @@ Two LanceDB tables share one database folder. Independent compaction/versioning,
 |------|---------|
 | `src/claude_rag/core.py` | Shared library: chunk → embed (LM Studio) → upsert (LanceDB), dedup, search |
 | `src/claude_rag/mcp_server.py` | FastMCP server — `search_memory`, `search_knowledge`, `search_all`, `search_project`, `search_recent` |
-| `ingest_files.py` | Walk project dirs → memory table (nightly + manual) |
+| `ingest_files.py` | Walk project dirs → memory table (skips hidden/noise dirs) |
 | `ingest_transcript.py` | Ingest a single Claude Code session JSONL → memory (SessionEnd hook) |
-| `ingest_export.py` | Ingest claude.ai exports from inbox → memory (nightly + manual) |
+| `ingest_export.py` | Ingest claude.ai exports from inbox → memory |
 | `ingest_knowledge.py` | PDF-aware ingestion → knowledge table (manual, `<path>`) |
+| `claude-rag` | On-demand CLI: ensure LM Studio + model, then ingest/optimize; also `search`/`status` (symlinked onto PATH) |
 | `claude_rag_sessionend_hook.sh` | SessionEnd hook (fire-and-forget bash script) |
-| `com.clauderag.nightly.plist` | launchd agent (nightly ingest + maintenance at 03:00) |
 | `claude-rag-plan.md` | Full architecture and design plan — read before structural changes |
 | `HOW-TO-USE.md` | Practical usage guide: setup, search tools, troubleshooting |
 | `CHANGELOG.md` | Release history |
@@ -57,27 +57,35 @@ Two LanceDB tables share one database folder. Independent compaction/versioning,
 
 ## Common commands
 
-### Ingestion (manual, immediate)
+### `claude-rag` CLI (on-demand — the primary entry point)
+
+Installed as a symlink on PATH (`/opt/homebrew/bin/claude-rag` → repo). Ensures
+LM Studio is running with the embedding model loaded (launching the app if
+needed) before anything that embeds. There is **no background scheduler** — you
+run it when you want to refresh the index.
 
 ```bash
-# Re-index project files → memory
-python ingest_files.py
-
-# Ingest a single transcript or folder of transcripts → memory
-python ingest_transcript.py <path-to-jsonl-or-dir>
-
-# Ingest exported claude.ai chats from inbox → memory
-python ingest_export.py
-
-# Ingest a PDF/book/manual → knowledge (PDF-aware, heading-aware chunking)
-python ingest_knowledge.py <path-to-pdf-or-folder>
+claude-rag                 # sync: ingest ~/Projects + ~/Documents/notes + inboxes, then optimize
+claude-rag sync <dir>...   # sync specific dirs instead of the defaults
+claude-rag search <query>  # semantic search across memory + knowledge
+claude-rag status          # LM Studio + table status
 ```
 
-### Inboxes (lazy, nightly pickup via launchd)
+### Ingestion (direct scripts, need the venv + LM Studio already up)
+
+```bash
+.venv/bin/python ingest_files.py [--dirs <dir>...]        # project files → memory
+.venv/bin/python ingest_transcript.py <jsonl-or-dir>       # session transcript(s) → memory
+.venv/bin/python ingest_export.py                          # claude.ai exports inbox → memory
+.venv/bin/python ingest_knowledge.py <pdf-or-folder>       # PDF/doc → knowledge
+```
+
+### Inboxes (swept by `claude-rag sync`)
 
 ```bash
 ~/.local/share/claude-rag/knowledge-inbox/    # docs/books/manuals
 ~/.local/share/claude-rag/exports-inbox/      # claude.ai exports
+~/.local/share/claude-rag/logs/sessions/      # transcripts archived by the SessionEnd hook
 ```
 
 ### Claude Code MCP registration
@@ -93,9 +101,8 @@ claude mcp add claude-rag -- \
 
 ## Prerequisites
 
-- **LM Studio** running with an **embedding model loaded** (not a chat model) at `http://localhost:1234/v1/embeddings`. The embedder must be loaded on startup — hooks and nightly jobs hit a cold endpoint otherwise.
-- **LanceDB** installed (`pip install lancedb`). Data lives as files on disk.
-- **macOS launchd** for the nightly agent (files + exports + maintenance at 03:00).
+- **LM Studio** with the embedding model downloaded (not a chat model), serving the OpenAI-compatible API at `http://localhost:1234/v1`. `claude-rag` starts the app/server and loads the model on demand, so it need not be running beforehand — but the model must be downloaded.
+- **LanceDB** installed (in the venv). Data lives as files on disk.
 
 ## Hardware target
 
@@ -106,8 +113,8 @@ MacBook Pro, Apple Silicon, 64 GB unified memory. Embedding models are <1 GB; co
 - **Local-first** — no external API calls; LM Studio + LanceDB both on-device.
 - **Two collections, one stack** — memory vs knowledge share machinery but stay in separate tables.
 - **RAG is the archive, not working memory** — CLAUDE.md stays as live instructions; RAG holds retrievable long-term knowledge.
-- **Passive maintenance** — nightly `optimize()` + 7-day version pruning; you don't think about it.
-- **Fire-and-forget capture** — hooks never slow your workflow (detached subprocess, returns immediately).
+- **On-demand maintenance** — `claude-rag` runs ingest + `optimize()` + 7-day version pruning when you invoke it; no background scheduler.
+- **Fire-and-forget capture** — the SessionEnd hook archives transcripts without slowing your workflow (detached subprocess, returns immediately).
 - **Idempotent ingestion** — mtime + content_hash dedup; re-run freely, no duplicates.
 
 ## Current status
@@ -116,6 +123,8 @@ Working end-to-end (verified 2026-07-02). Environment is `uv`-managed
 (`.venv`, Python 3.12); deps installed via `uv pip install -e ".[dev]"`.
 Embeddings served by LM Studio model `text-embedding-nomic-embed-text-v1.5`
 (768-dim) — set as the default in `core.py`, overridable via
-`CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL`. Verified: real ingest (memory +
-knowledge tables), semantic search, project filter, idempotent dedup,
-`optimize_table`, and all 6 MCP tools registering over stdio.
+`CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL`. Operated on demand via the `claude-rag`
+CLI (no launchd scheduler). The MCP server is registered with Claude Code and
+the SessionEnd hook archives transcripts to the sessions inbox. Verified: real
+ingest (memory + knowledge), semantic search, project filter, idempotent dedup,
+hidden-dir exclusion, `optimize_table`, and all 6 MCP tools over stdio.

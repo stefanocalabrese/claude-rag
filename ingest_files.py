@@ -82,17 +82,23 @@ def _walk_files(directories: list[str], extensions: set[str]) -> list[Path]:
             files.extend(dir_path.rglob(f"*{ext}"))
 
     # Deduplicate and filter out non-files
+    noise_dirs = {"node_modules", "__pycache__", "venv", ".venv", ".tox",
+                  "dist", "build", "target"}
     seen = set()
     result = []
     for f in sorted(files):
-        if f.is_file() and str(f) not in seen:
-            # Skip common noise directories
-            parts = [p.lower() for p in f.parts]
-            if any(skip in parts for skip in ["node_modules", ".git", "__pycache__",
-                                               "venv", ".venv", ".tox", "dist", "build"]):
-                continue
-            seen.add(str(f))
-            result.append(f)
+        if not (f.is_file() and str(f) not in seen):
+            continue
+        parts = f.parts
+        # Skip anything under a hidden dir or a dotfile itself (.git, .remember,
+        # .claude, .idea, .gitignore …) — never embed private/tooling state.
+        if any(p.startswith(".") for p in parts):
+            continue
+        # Skip known heavy/generated noise directories.
+        if any(p.lower() in noise_dirs for p in parts):
+            continue
+        seen.add(str(f))
+        result.append(f)
 
     return result
 

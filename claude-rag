@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# claude-rag — on-demand control for the local RAG + memory system.
+#
+# Usage:
+#   claude-rag [sync] [DIR ...]   Ensure LM Studio + model, then ingest & optimize
+#                                 (defaults to ~/Projects and ~/Documents/notes)
+#   claude-rag search <query>     Semantic search across memory + knowledge
+#   claude-rag status             Show LM Studio + table status
+#   claude-rag help               Show this help
+#
+# Any command that needs embeddings first ensures LM Studio is running with the
+# embedding model loaded — launching the app and starting the server if needed.
+
+set -uo pipefail
+
+# --- resolve repo dir (this script is usually invoked via a PATH symlink) ---
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [ "${SOURCE#/}" != "$SOURCE" ] || SOURCE="$DIR/$SOURCE"   # relative -> absolute
+done
+REPO_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+cd "$REPO_DIR" || exit 1
+
+PY="${REPO_DIR}/.venv/bin/python"
+LMS="${HOME}/.lmstudio/bin/lms"
+API="http://localhost:1234/v1/models"
+MODEL="${CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL:-text-embedding-nomic-embed-text-v1.5}"
+DATA="${HOME}/.local/share/claude-rag"
+LOG="${DATA}/logs/claude-rag.log"
+SESSIONS_INBOX="${DATA}/logs/sessions"
+KNOWLEDGE_INBOX="${DATA}/knowledge-inbox"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+claude-rag — on-demand control for the local RAG + memory system.
+
+Usage:
+  claude-rag [sync] [DIR ...]   Ensure LM Studio + model, then ingest & optimize
+                                (defaults to ~/Projects and ~/Documents/notes)
+  claude-rag search <query>     Semantic search across memory + knowledge
+  claude-rag status             Show LM Studio + table status
+  claude-rag help               Show this help
+EOF
+}
+
+ensure_lmstudio() {
+    if ! curl -sf -m 3 "$API" >/dev/null 2>&1; then
+        log "→ LM Studio server not reachable; starting LM Studio…"
+        open -a "LM Studio" 2>/dev/null || true
+        local i
+        for i in $(seq 1 45); do
+            "$LMS" server start >/dev/null 2>&1
+            curl -sf -m 2 "$API" >/dev/null 2>&1 && break
+            sleep 1
+        done
+    fi
+    "$LMS" server start >/dev/null 2>&1 || true
+
+    # Guarded load: a blind `lms load` on an already-loaded model spawns a duplicate.
+    if ! "$LMS" ps 2>/dev/null | grep -q "$MODEL"; then
+        log "→ loading embedding model $MODEL…"
+        "$LMS" load "$MODEL" -y >/dev/null 2>&1 || true
+    fi
+
+    if curl -sf -m 5 "$API" 2>/dev/null | grep -q "$MODEL"; then
+        log "✓ LM Studio ready ($MODEL)"
+        return 0
+    fi
+    log "✗ LM Studio not ready — model '$MODEL' unavailable at $API"
+    log "  Open LM Studio, load the embedding model, then retry."
+    return 1
+}
+
+cmd_sync() {
+    ensure_lmstudio || return 1
+    local dirs=("$@")
+    if [ "${#dirs[@]}" -eq 0 ]; then
+        dirs=("${HOME}/Projects" "${HOME}/Documents/notes")
+    fi
+    log "→ project files: ${dirs[*]}"
+    "$PY" ingest_files.py --dirs "${dirs[@]}" 2>>"$LOG" || log "  (ingest_files errors — see $LOG)"
+    log "→ claude.ai exports inbox"
+    "$PY" ingest_export.py 2>>"$LOG" || log "  (ingest_export errors)"
+    if [ -d "$SESSIONS_INBOX" ]; then
+        log "→ archived session transcripts"
+        "$PY" ingest_transcript.py "$SESSIONS_INBOX" 2>>"$LOG" || log "  (ingest_transcript errors)"
+    fi
+    log "→ knowledge inbox"
+    "$PY" ingest_knowledge.py "$KNOWLEDGE_INBOX" 2>>"$LOG" || log "  (ingest_knowledge errors)"
+    log "→ compacting + pruning old versions"
+    "$PY" - 2>>"$LOG" <<'PYEOF' || log "  (optimize errors)"
+from claude_rag.core import optimize_table, table_exists
+for t in ("memory", "knowledge"):
+    if table_exists(t):
+        optimize_table(t, cleanup_older_than_days=7)
+PYEOF
+    log "✓ sync complete"
+}
+
+cmd_search() {
+    if [ "$#" -eq 0 ]; then log "usage: claude-rag search <query>"; return 2; fi
+    ensure_lmstudio || return 1
+    CLAUDE_RAG_QUERY="$*" "$PY" - <<'PYEOF'
+import os
+from claude_rag.core import search_table, table_exists
+q = os.environ["CLAUDE_RAG_QUERY"]
+hit = False
+for table, label in (("memory", "memory"), ("knowledge", "knowledge")):
+    if not table_exists(table):
+        continue
+    for h in search_table(table, q, k=5):
+        hit = True
+        score = 1.0 - h.get("vector_distance", 0.0)
+        name = (h.get("path") or h.get("title") or "").split("/")[-1]
+        text = " ".join((h.get("text") or "").split())
+        print(f"[{label}] {score:.3f}  {name}")
+        print("          " + text[:120])
+if not hit:
+    print("no results (run: claude-rag sync)")
+PYEOF
+}
+
+cmd_status() {
+    echo "LM Studio:"
+    if curl -sf -m 3 "$API" >/dev/null 2>&1; then
+        echo "  server : running (port 1234)"
+        if "$LMS" ps 2>/dev/null | grep -q "$MODEL"; then
+            echo "  model  : $MODEL (loaded)"
+        else
+            echo "  model  : $MODEL (NOT loaded)"
+        fi
+    else
+        echo "  server : not running"
+    fi
+    echo "Tables:"
+    "$PY" - <<'PYEOF'
+from claude_rag.core import get_table_stats
+for t in ("memory", "knowledge"):
+    s = get_table_stats(t)
+    print(f"  {t:9s}: " + (f"{s['row_count']} rows" if s.get('exists') else "empty"))
+PYEOF
+}
+
+SUBCMD="${1:-sync}"
+[ "$#" -gt 0 ] && shift
+case "$SUBCMD" in
+    sync)          cmd_sync "$@" ;;
+    search)        cmd_search "$@" ;;
+    status)        cmd_status ;;
+    help|-h|--help) usage ;;
+    *)             echo "unknown command: $SUBCMD"; echo "try: claude-rag help"; exit 2 ;;
+esac
