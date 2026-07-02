@@ -63,7 +63,7 @@ ensure_lmstudio() {
 
     # Guarded load: a blind `lms load` on an already-loaded model spawns a duplicate.
     if ! "$LMS" ps 2>/dev/null | grep -q "$MODEL"; then
-        log "→ loading embedding model $MODEL…"
+        log "→ loading embedding model ${MODEL}…"
         "$LMS" load "$MODEL" -y >/dev/null 2>&1 || true
     fi
 
