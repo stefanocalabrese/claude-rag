@@ -51,8 +51,8 @@ launch, no cloud dependency.
         └─────────────────────────┘   └───────────────────────────┘
                 ▲             ▲
                 │             │
-        SessionEnd hook   nightly launchd
-        (transcripts)     (files + maintenance)
+        SessionEnd hook   claude-rag CLI
+        (archive)         (on-demand sync + maintenance)
 ```
 
 ---
@@ -94,7 +94,7 @@ and the folder *is* the database (copy it to back up, move it to relocate).
 | Sources         | project files, transcripts, exports     | docs, books, manuals, reference PDFs   |
 | Nature          | personal, changing, you-specific        | external, static, authored by others   |
 | Chunking        | exchange-level / small structured       | larger, heading-aware, with overlap    |
-| Update cadence  | continuous (hook + nightly)             | on-demand (manual run)                 |
+| Update cadence  | on-demand (`claude-rag`; hook archives) | on-demand (`claude-rag` / manual run)  |
 | Retrieval       | "what was I doing / working on"         | "how does X work per the docs"         |
 
 Kept as **two separate tables** in the same LanceDB folder: independent
@@ -145,22 +145,32 @@ changed content (mtime + content_hash check).
 
 ## 6. Automation
 
-### SessionEnd hook (transcripts, near-real-time)
-- Fires `ingest_transcript.py` on the just-finished session.
-- **Fire-and-forget**: spawns the ingest detached and returns immediately, so it
-  never delays your shell.
-- Skips trivial sessions below a content threshold.
+**Design choice:** no background scheduler. Capture is event-driven (a
+lightweight hook) and all heavy work is on-demand via the `claude-rag` command.
+Nothing runs at 03:00; you refresh the index when you want to.
 
-### Nightly launchd agent (files + maintenance)
-- Runs `ingest_files.py` over project dirs + `ingest_export.py` over the inbox.
-- Then runs LanceDB maintenance:
+### SessionEnd hook (transcript archive)
+- Reads the hook payload from **stdin** (Claude Code passes `transcript_path`
+  as JSON on stdin, not as an argument).
+- **Fire-and-forget**: copies the transcript to the sessions inbox and spawns a
+  detached ingest, returning immediately so it never delays your shell.
+- Skips trivial sessions below a content threshold. If LM Studio is down the
+  immediate ingest simply fails; the archived copy is swept by the next
+  `claude-rag sync`.
+
+### `claude-rag` command (on-demand sync + maintenance)
+- Installed as a symlink on `PATH` (`/opt/homebrew/bin/claude-rag`).
+- **Ensures LM Studio is ready first**: if the server is unreachable it launches
+  the app, starts the server, and loads the embedding model (guarded — a blind
+  `lms load` on an already-loaded model spawns a duplicate instance).
+- `claude-rag sync` (default) ingests project dirs + exports + sessions +
+  knowledge inboxes, then runs LanceDB maintenance:
   - `table.optimize(cleanup_older_than=timedelta(days=7))` — compacts small
     files and prunes versions older than 7 days.
-- Uses **launchd** (not cron): catches up missed runs after the Mac wakes.
-- `StartCalendarInterval` for a fixed nightly time (e.g. 03:00).
+- Also `claude-rag search <query>` and `claude-rag status`.
 
 ### Concurrency safety
-- A **lock file** in `locks/` serializes writers so the nightly run and a
+- A **lock file** in `locks/` serializes writers so a manual run and a
   hook-triggered ingest can't write simultaneously.
 - Maintenance never runs in the retrieval/request path (no startup-time
   compaction in the MCP server).
@@ -190,9 +200,9 @@ every hit.
 
 ## 8. Maintenance strategy (compaction + cleanup)
 
-Two passive layers, zero ongoing attention:
-1. **Inline** — `optimize()` at the end of the nightly ingest (covers the common
-   case for free).
+Runs as part of every `claude-rag sync`, zero separate attention:
+1. **Inline** — `optimize()` at the end of each sync (compacts + prunes in one
+   pass; covers the common case for free).
 2. **Safety net** — a threshold-based check (fragment count / version count)
    that only does real work when thresholds are crossed.
 
@@ -207,33 +217,33 @@ Caveats:
 
 Every ingest path works the same underneath: **detect new/changed → chunk →
 embed via LM Studio → upsert into the right table**. "Adding a document" is
-always one of two gestures: drop it in an inbox (lazy — picked up by the nightly
-run) or run the matching ingester (immediate). Content-hash dedup means you can
-re-run any of these freely without creating duplicates.
+always one of two gestures: drop it in an inbox (picked up on the next
+`claude-rag sync`) or run the matching ingester (immediate). Content-hash dedup
+means you can re-run any of these freely without creating duplicates.
 
-> **Prerequisite for any ingestion:** LM Studio must be running with the
-> **embedding** model loaded. If it's closed or the model isn't loaded, the
-> embed call fails. Set the embedder to load on LM Studio startup so the nightly
-> job and hooks never hit a cold endpoint.
+> **LM Studio:** the `claude-rag` command handles this for you — it launches LM
+> Studio, starts the server, and loads the embedding model on demand. Only the
+> raw `ingest_*.py` scripts and the SessionEnd hook assume LM Studio is already
+> up; if it isn't, they fail cleanly and `claude-rag sync` catches up later.
 
 ### 9.1 Adding to the KNOWLEDGE collection (docs, books, manuals)
 
 On-demand path. Both options land in the `knowledge` table.
 
-**Option A — drop and wait (lazy, nightly):**
+**Option A — drop in the inbox, sync later:**
 ```bash
 cp ~/Downloads/some-manual.pdf ~/.local/share/claude-rag/knowledge-inbox/
 ```
-The nightly launchd agent scans the inbox, ingests anything new, and embeds it.
-Zero effort; available after the next 03:00 run.
+`claude-rag sync` scans the inbox, ingests anything new, and embeds it — no
+separate command needed the next time you sync.
 
 **Option B — run it now (immediate):**
 ```bash
 # single file
-python ingest_knowledge.py ~/Downloads/some-manual.pdf
+.venv/bin/python ingest_knowledge.py ~/Downloads/some-manual.pdf
 
 # whole folder
-python ingest_knowledge.py ~/Documents/manuals/
+.venv/bin/python ingest_knowledge.py ~/Documents/manuals/
 ```
 PDF-aware (text extraction + heading-aware chunking); also handles markdown and
 text. Idempotent — unchanged files are skipped via content hash.
@@ -242,23 +252,23 @@ text. Idempotent — unchanged files are skipped via content hash.
 
 Mostly automatic, with manual overrides available.
 
-**Project files** — covered by config; the nightly `ingest_files.py` walks your
-configured directories. To force an immediate index:
+**Project files** — `claude-rag sync` walks your configured directories
+(skipping hidden/noise dirs). To index a specific set immediately:
 ```bash
-python ingest_files.py
+claude-rag sync ~/code ~/Documents/notes
 ```
 
-**Claude Code transcripts** — captured automatically by the SessionEnd hook
-after each session. No action needed. (Trivial sessions below the content
-threshold are skipped.)
+**Claude Code transcripts** — the SessionEnd hook archives each finished session
+to the sessions inbox; `claude-rag sync` ingests them. (Trivial sessions below
+the content threshold are skipped.)
 
 **Exported claude.ai chats** — drop them in the exports inbox:
 ```bash
 cp ~/Downloads/my-export.json ~/.local/share/claude-rag/exports-inbox/
 ```
-Picked up nightly, or run immediately:
+Ingested on the next `claude-rag sync`, or run immediately:
 ```bash
-python ingest_export.py
+.venv/bin/python ingest_export.py
 ```
 
 ### 9.3 Searching (from Claude Code)
@@ -278,20 +288,21 @@ for…") or rely on Claude to call them. Tools:
 ### 9.4 Operational cheatsheet
 
 ```bash
-# Add a book/manual right now
-python ingest_knowledge.py <path-to-pdf-or-folder>
+# Ensure LM Studio + model, then ingest everything and optimize
+claude-rag                                    # (= claude-rag sync)
 
-# Re-index project files right now (don't wait for nightly)
-python ingest_files.py
+# Search from the terminal / check status
+claude-rag search "how does dedup work"
+claude-rag status
 
-# Add exported claude.ai chats right now
-python ingest_export.py
+# Add a book/manual right now (LM Studio must already be up)
+.venv/bin/python ingest_knowledge.py <path-to-pdf-or-folder>
 
-# Inboxes (lazy drop, nightly pickup)
+# Inboxes (drop now, ingested on the next `claude-rag sync`)
 ~/.local/share/claude-rag/knowledge-inbox/    # docs/books/manuals
 ~/.local/share/claude-rag/exports-inbox/      # claude.ai exports
 
-# Logs (check what the nightly run / hooks did)
+# Logs (what sync / hooks did)
 ~/.local/share/claude-rag/logs/
 ```
 
@@ -303,19 +314,19 @@ wired into the ingesters.
 
 ---
 
-## 10. Deliverables to scaffold
+## 10. Deliverables (built & verified)
 
-- [ ] Shared core: embed (LM Studio) + chunk + upsert + dedup
-- [ ] `ingest_files.py` (project files → memory)
-- [ ] `ingest_transcript.py` (Claude Code sessions → memory)
-- [ ] `ingest_export.py` (claude.ai exports → memory)
-- [ ] `ingest_knowledge.py` (PDF-aware → knowledge)
-- [ ] MCP server (`search_memory` / `search_knowledge` / `search_all` /
-      `search_project` / `search_recent`)
-- [ ] SessionEnd hook config (fire-and-forget transcript ingest)
-- [ ] Nightly launchd plist (files + export + maintenance)
-- [ ] `claude mcp add` command
-- [ ] README (setup, usage, tuning)
+- [x] Shared core: embed (LM Studio) + chunk + upsert + dedup
+- [x] `ingest_files.py` (project files → memory; skips hidden/noise dirs)
+- [x] `ingest_transcript.py` (Claude Code sessions → memory)
+- [x] `ingest_export.py` (claude.ai exports → memory)
+- [x] `ingest_knowledge.py` (PDF-aware → knowledge)
+- [x] MCP server (`search_memory` / `search_knowledge` / `search_all` /
+      `search_project` / `search_recent` + `table_stats`)
+- [x] SessionEnd hook (fire-and-forget transcript archive, stdin payload)
+- [x] `claude-rag` CLI (on-demand LM Studio ensure + sync/search/status)
+- [x] `claude mcp add` registration
+- [x] README + `HOW-TO-USE.md`
 
 ---
 
@@ -368,11 +379,11 @@ both models + system still fit with room to spare.
 
 ### Why contention is a non-issue here
 
-- **Fire-and-forget hook** — per-session transcript embed runs detached; never
+- **Fire-and-forget hook** — per-session transcript archive runs detached; never
   blocks inference.
-- **Nightly batch** — bulk file embedding happens at 03:00 when you're not
-  inferencing. Only the small per-session transcript embed competes in real
-  time.
+- **On-demand batch** — bulk file embedding happens only when you run
+  `claude-rag`, so you choose a moment when you're not inferencing. Nothing
+  competes in the background.
 
 ---
 
@@ -383,7 +394,8 @@ both models + system still fit with room to spare.
   share machinery.
 - **RAG is the archive, not the working memory** — CLAUDE.md stays as live
   instructions; RAG holds retrievable long-term knowledge.
-- **Passive maintenance** — automation does the upkeep; you don't think about it.
+- **On-demand maintenance** — `claude-rag` does the upkeep when you run it; no
+  background scheduler.
 - **Self-contained chunks** — chunk text stored in-table for simple, robust
   retrieval.
-- **Fire-and-forget capture** — hooks never slow your workflow.
+- **Fire-and-forget capture** — the SessionEnd hook never slows your workflow.
