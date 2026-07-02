@@ -210,22 +210,24 @@ def main() -> None:
 
     if path_obj.is_dir():
         # Ingest all supported files in directory
-        results = []
+        files: list[Path] = []
         for ext in SUPPORTED_EXTENSIONS:
-            results.extend(path_obj.rglob(f"*{ext}"))
+            files.extend(path_obj.rglob(f"*{ext}"))
 
-        if not results:
+        if not files:
             logger.info("No supported files found in %s", path_obj)
             print(f"No supported files ({SUPPORTED_EXTENSIONS}) in {path_obj}")
             return
 
-        results.sort()
-        for filepath in results:
+        files.sort()
+        results = []
+        for filepath in files:
             result = ingest(filepath)
+            results.append(result)
             print(json.dumps(result, indent=2))
 
         total_chunks = sum(r.get("chunks", 0) for r in results if "error" not in r)
-        print(f"\nTotal: {len(results)} files, {total_chunks} chunks")
+        print(f"\nTotal: {len(files)} files, {total_chunks} chunks")
 
     else:
         result = ingest(path_obj)
