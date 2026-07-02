@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.clauderag.nightly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>
+            cd /Users/stefano/Projects/claude-rag &amp;&amp; \
+            .venv/bin/python ingest_files.py --dirs /Users/stefano/Projects /Users/stefano/Documents/notes 2&gt;&gt; ~/.local/share/claude-rag/logs/nightly.log &amp;&amp; \
+            .venv/bin/python ingest_export.py 2&gt;&gt; ~/.local/share/claude-rag/logs/nightly.log &amp;&amp; \
+            .venv/bin/python -c "
+from claude_rag.core import optimize_table, table_exists
+for t in ['memory', 'knowledge']:
+    if table_exists(t): optimize_table(t, cleanup_older_than_days=7)
+" 2&gt;&gt; ~/.local/share/claude-rag/logs/nightly.log
+        </string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/stefano/.local/share/claude-rag/logs/nightly.log</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/stefano/.local/share/claude-rag/logs/nightly.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

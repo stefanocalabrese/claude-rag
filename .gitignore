@@ -1,0 +1,20 @@
+# Dependencies
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# LanceDB data (lives in ~/.local/share, not here)
+*.lance/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local machine settings (not shared)
+.claude/settings.local.json
+
+# Private session-memory buffers (personal, never published)
+.remember/
