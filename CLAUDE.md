@@ -49,10 +49,11 @@ Two LanceDB tables share one database folder. Independent compaction/versioning,
 ~/.local/share/claude-rag/
 ├── lancedb/memory.lance/       # memory table
 ├── lancedb/knowledge.lance/    # knowledge table
-├── knowledge-inbox/            # drop PDFs/docs here (nightly pickup)
-├── exports-inbox/              # drop claude.ai exports here (nightly pickup)
+├── knowledge-inbox/            # drop PDFs/docs here (ingested on next `claude-rag sync`)
+├── exports-inbox/              # drop claude.ai exports here (ingested on next `claude-rag sync`)
+├── logs/sessions/              # transcripts archived by the SessionEnd hook
 ├── locks/                      # lock files for writer serialization
-└── logs/                       # ingestion + maintenance logs
+└── logs/                       # ingestion + sync logs
 ```
 
 ## Common commands

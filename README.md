@@ -1,6 +1,8 @@
 # claude-rag
 
-Local-first RAG + memory system for Claude Code. Runs 100% on-device (macOS, Apple Silicon).
+Local-first RAG + memory system for Claude Code. Runs 100% on-device (macOS,
+Apple Silicon). **No background daemon** — you drive it with the `claude-rag`
+command, which starts LM Studio and loads the embedding model on demand.
 
 ## What it does
 
@@ -11,20 +13,48 @@ Two collections from one shared stack:
 
 ## Prerequisites
 
-1. **LM Studio** running with an embedding model loaded at `http://localhost:1234/v1/embeddings`
-2. Python 3.11+
+1. **LM Studio** with an embedding model **downloaded** (`text-embedding-nomic-embed-text-v1.5`). It need not be running — `claude-rag` launches it, starts the server, and loads the model on demand.
+2. Python 3.11+ and [`uv`](https://github.com/astral-sh/uv)
 
 ## Setup
 
 ```bash
-cd claude-rag
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+cd /Users/stefano/Projects/claude-rag
+uv venv --python 3.12
+uv pip install -e ".[dev]"
 
-# Set the embedding model (must match what's loaded in LM Studio)
-export CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5
+# Install the command on your PATH
+ln -sf "$PWD/claude-rag" /opt/homebrew/bin/claude-rag
+
+# Register the MCP server with Claude Code (venv python + real server path)
+claude mcp add claude-rag --scope user -- \
+  "$PWD/.venv/bin/python" "$PWD/src/claude_rag/mcp_server.py"
 ```
+
+The embedding model defaults to `text-embedding-nomic-embed-text-v1.5` in
+`core.py`; override with `CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL` if you use a
+different one.
+
+## Usage
+
+```bash
+claude-rag                 # ensure LM Studio + model, ingest everything, optimize
+claude-rag sync <dir>...   # sync specific dirs
+claude-rag search <query>  # semantic search from the terminal
+claude-rag status          # LM Studio + table status
+```
+
+Inside Claude Code, the MCP tools (`search_memory`, `search_knowledge`,
+`search_all`, `search_project`, `search_recent`) are available in every session.
+
+Direct ingest scripts (need the venv + LM Studio already up):
+
+```bash
+.venv/bin/python ingest_files.py [--dirs <dir>...]
+.venv/bin/python ingest_knowledge.py <path-to-pdf-or-folder>
+```
+
+See **[HOW-TO-USE.md](HOW-TO-USE.md)** for the full guide.
 
 ## Storage layout (runtime, not in repo)
 
@@ -32,65 +62,38 @@ export CLAUDE_RAG_LM_STUDIO_EMBEDDING_MODEL=text-embedding-nomic-embed-text-v1.5
 ~/.local/share/claude-rag/
 ├── lancedb/memory.lance/       # memory table
 ├── lancedb/knowledge.lance/    # knowledge table
-├── knowledge-inbox/            # drop PDFs/docs here (nightly pickup)
-├── exports-inbox/             # drop claude.ai exports here (nightly pickup)
+├── knowledge-inbox/            # drop PDFs/docs here (ingested on next `claude-rag sync`)
+├── exports-inbox/              # drop claude.ai exports here
+├── logs/sessions/              # transcripts archived by the SessionEnd hook
 ├── locks/                      # writer serialization
-└── logs/                       # ingestion + maintenance logs
+└── logs/                       # ingestion + sync logs
 ```
 
-## Usage
+## Architecture
 
-### Ingestion (manual, immediate)
-
-```bash
-# Project files → memory
-python ingest_files.py
-
-# Claude Code transcript → memory
-python ingest_transcript.py <path-to-jsonl>
-
-# Exported claude.ai chats → memory
-python ingest_export.py
-
-# PDF/book/manual → knowledge (PDF-aware)
-python ingest_knowledge.py <path-to-pdf-or-folder>
-```
-
-### Inboxes (lazy, nightly pickup)
-
-Drop files in the inbox directories — picked up by the launchd agent at 03:00.
-
-### Claude Code MCP registration
-
-```bash
-claude mcp add claude-rag python /Users/stefano/Projects/claude-rag/src/claude_rag/mcp_server.py
-```
-
-### Nightly automation (launchd)
-
-```bash
-# Install the launchd agent
-cp com.clauderag.nightly.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.clauderag.nightly.plist
-```
+Claude Code spawns the MCP server over stdio. Search tools embed the query via LM
+Studio and run vector search over LanceDB. Ingestion (files, transcripts,
+exports, knowledge) shares one core — chunk → embed → upsert with mtime +
+content-hash dedup. The `claude-rag` command orchestrates LM Studio startup +
+ingest + maintenance on demand; the SessionEnd hook archives transcripts to the
+sessions inbox for the next sync. Two tables (`memory`, `knowledge`) live in one
+LanceDB folder with independent compaction.
 
 ## Guides
 
-- [HOW-TO-USE.md](HOW-TO-USE.md) — practical guide: setup, search tools, adding content, troubleshooting
+- [HOW-TO-USE.md](HOW-TO-USE.md) — practical guide: setup, the `claude-rag` command, search tools, adding content, troubleshooting
 - [claude-rag-plan.md](claude-rag-plan.md) — full architecture and design plan
 - [CHANGELOG.md](CHANGELOG.md) — release history
-
-## Architecture
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `src/claude_rag/core.py` | Shared library: chunk → embed → upsert, dedup, search |
-| `src/claude_rag/mcp_server.py` | FastMCP server with 5 search tools |
-| `ingest_files.py` | Project files → memory |
+| `src/claude_rag/mcp_server.py` | FastMCP server (6 tools: 5 search + `table_stats`) |
+| `claude-rag` | On-demand CLI: ensure LM Studio + model, then sync/search/status |
+| `ingest_files.py` | Project files → memory (skips hidden/noise dirs) |
 | `ingest_transcript.py` | Claude Code sessions → memory |
 | `ingest_export.py` | claude.ai exports → memory |
 | `ingest_knowledge.py` | PDF-aware docs → knowledge |
-| `claude_rag_sessionend_hook.sh` | SessionEnd hook (fire-and-forget) |
-| `com.clauderag.nightly.plist` | launchd agent (nightly ingest + maintenance) |
+| `claude_rag_sessionend_hook.sh` | SessionEnd hook (archives transcripts) |
